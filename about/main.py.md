@@ -5,3 +5,4 @@
 5. **openImage(fileName: str, filePath: str)**: retrieves UID and file format from [[dbHandlers.py]] and returns the file.
 6. **deleteFromDisk(fileName: str, filePath: str)**: retrieves UID and format from [[dbHandlers.py]], storage location from [[(dot)env]] and deletes the file from the disk. Then clears the entry from trashDB [[dbTrashHandlers.py]]
 7. **saveNewFile(file: FileStorage, filePath: str)**: Gets the storage location from [[(dot)env]], extracts the file name and saves the file to disk. Then adds entry to the main db [[dbHandlers.py]]
+8. **openVideo(filename: str,  filePath: str)**: retrieves UID and format, loads the file in memory using [[dbHandlers.py]]. Checks the size for chunking, chunks the file and starts returning the chunks.

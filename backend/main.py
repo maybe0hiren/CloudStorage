@@ -3,6 +3,7 @@ from pathlib import Path
 
 from werkzeug.datastructures import FileStorage # gives usable file datatype
 from werkzeug.utils import secure_filename # extracts name from path
+import mimetypes
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -45,16 +46,9 @@ def createTextFile(fileName: str, filePath: str, content: str = None):
     if UID != -1:
         return 0
 
-
-# Check Important Notes (2)
 def openFile(fileName: str, filePath: str):
     print("openFile() called")
 
-    VIDEO_EXTENSIONS = {
-    ".mp4", ".mkv", ".avi", ".mov", ".wmv",
-    ".flv", ".webm", ".m4v", ".mpeg", ".mpg", ".3gp"
-    }
-    
     # get UID for the file
     UID = dbHandlers.getID(filePath, fileName)
     if UID is None:
@@ -69,7 +63,6 @@ def openFile(fileName: str, filePath: str):
 
     file = textFileHandlers.readFile(UID, fileFormat)
     return file
-
 
 def editTextFile(fileName: str, filePath: str, content: str):
     # safety check
@@ -115,7 +108,48 @@ def openImage(fileName: str, filePath: str):
     
     return file        
 
+#-------------- Video -----------------------------
+CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB
+def openVideo(fileName: str, filePath: str):
+    print("openVideo() called")
 
+    # Get UID and format
+    UID = dbHandlers.getID(filePath, fileName)
+    fileFormat = dbHandlers.getValue(UID, "Format")
+    if not UID or not fileFormat:
+        print("Error: file does not exist")
+        return -1
+
+    # Get video/audio from storage
+    fullPath = Path(filePath) / f"{UID}.{fileFormat}"
+    if not fullPath.exists():
+        print("File does not exist.")
+        return -1
+
+    # Size checks for threshold
+    fileSize = fullPath.stat().st_size
+    totalChunks = (fileSize + CHUNK_SIZE - 1) // CHUNK_SIZE
+    # Metadata for backend
+    metadata = {
+        "uid": uid,
+        "fileName": fileName,
+        "fileSize": fileSize,
+        "chunkSize": CHUNK_SIZE,
+        "totalChunks": totalChunks,
+        "mimeType": mimetypes.guess_type(fullPath)[0],
+    }
+
+    def chunkGenerator():
+        # Open video/audio (binary) files
+        with fullPath.open("rb") as file:
+            while True:
+                # Create chuncks of 100 MB
+                chunk = file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                # yeild returns the vlaues without stopping the functions
+                yield chunk
+    return metadata, chunkGenerator()
 
 #-------------- Common -----------------------------
 
