@@ -3,27 +3,45 @@ import database.dbHandlers as dbHandlers
 
 
 def trash(UID: str):
-    # get the last location of the file
-    lastLoc = dbHandlers.getValue(UID, "FilePath")
+    file = dbHandlers.getFile(UID)
+    if file is None:
+        return -1
 
-    # set the current location to trash/
-    dbHandlers.editPath(UID, "trash/")
+    if file["FilePath"] == "Trash/":
+        return 0
 
-    # make the entry in trash table
-    dbTrashHandlers.trashHandeling(UID, lastLoc)
+    lastLoc = file["FilePath"]
+
+    status = dbHandlers.deleteFile(UID)
+    if status != 0:
+        return -1
+
+    status = dbTrashHandlers.trashHandeling(UID, lastLoc)
+    if status != 0:
+        # Best effort rollback of the logical path.
+        dbHandlers.editPath(UID, lastLoc, file["FileName"])
+        return -1
+
+    return 0
 
 
 def restore(UID: str):
-    # get the last location of the trashed file
+    file = dbHandlers.getFile(UID)
+    if file is None:
+        return -1
+
     lastLoc = dbTrashHandlers.getValue(UID, "LastLoc")
+    if lastLoc is None:
+        return -1
 
-    # set the current location to last location if it exits, if dosent, restore to root /
-    if (pathExists(lastLoc)):
-        dbHandlers.editPath(UID, lastLoc)
-    else:
-        dbHandlers.editPath(UID, "home/")
+    fileName = file["FileName"]
+    newUID = dbHandlers.editPath(UID, lastLoc, fileName)
 
-    # delete the row from trash table
-    dbTrashHandlers.restoreHandeling(UID)
+    if newUID is None:
+        return -1
 
+    status = dbTrashHandlers.clearing(UID)
+    if status != 0:
+        return -1
 
+    return newUID

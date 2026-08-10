@@ -1,16 +1,27 @@
 import sqlite3
 from datetime import datetime, timedelta
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()
 
 
-DB_NAME = os.getenv("DATABASE_PATH")
+DB_NAME = os.getenv("DATABASE_PATH", "database/database.db")
 
 
 def getConnection():
-    return sqlite3.connect(DB_NAME)
+    try:
+        basePath = Path(__file__).resolve().parents[1]
+        databasePath = Path(DB_NAME)
+        if not databasePath.is_absolute():
+            databasePath = basePath / databasePath
+        databasePath = databasePath.resolve()
+        databasePath.parent.mkdir(parents=True, exist_ok=True)
+        return sqlite3.connect(str(databasePath))
+    except Exception as e:
+        print(f"Failed to connect to database: {e}")
+        return None
 
 
 def makeTable():
@@ -18,8 +29,10 @@ def makeTable():
 
     try:
         conn = getConnection()
-        cursor = conn.cursor()
+        if conn is None:
+            return -1
 
+        cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS Trash (
                 UID TEXT PRIMARY KEY,
@@ -29,26 +42,22 @@ def makeTable():
         """)
 
         conn.commit()
+        return 0
 
-    except Exception as e:
+    except sqlite3.Error as e:
         if conn:
             conn.rollback()
 
         print(f"Failed to create trash table: {e}")
+        return -1
 
     finally:
         if conn:
             conn.close()
 
-    return 0
-
 
 def getValue(uid: str, column: str):
-    allowed_columns = {
-        "UID",
-        "LastLoc",
-        "TrashedDate"
-    }
+    allowed_columns = {"UID", "LastLoc", "TrashedDate"}
 
     if column not in allowed_columns:
         raise ValueError(f"Invalid column name: {column}")
@@ -57,20 +66,55 @@ def getValue(uid: str, column: str):
 
     try:
         conn = getConnection()
-        cursor = conn.cursor()
+        if conn is None:
+            return None
 
+        cursor = conn.cursor()
         cursor.execute(f"""
             SELECT {column}
             FROM Trash
             WHERE UID = ?
         """, (uid,))
-        row = cursor.fetchone()
 
+        row = cursor.fetchone()
         return row[0] if row else None
 
-    except Exception as e:
+    except sqlite3.Error as e:
         print(f"Failed to get trash value: {e}")
         return None
+
+    finally:
+        if conn:
+            conn.close()
+
+
+def getTrash():
+    conn = None
+
+    try:
+        conn = getConnection()
+        if conn is None:
+            return []
+
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT UID, LastLoc, TrashedDate
+            FROM Trash
+            ORDER BY TrashedDate DESC
+        """)
+
+        return [
+            {
+                "UID": row[0],
+                "LastLoc": row[1],
+                "TrashedDate": row[2],
+            }
+            for row in cursor.fetchall()
+        ]
+
+    except sqlite3.Error as e:
+        print(f"Failed to get trash: {e}")
+        return []
 
     finally:
         if conn:
@@ -80,32 +124,32 @@ def getValue(uid: str, column: str):
 def trashHandeling(uid: str, lastLoc: str):
     conn = None
 
-
     try:
         today = datetime.now().strftime("%Y-%m-%d")
         conn = getConnection()
-        cursor = conn.cursor()
+        if conn is None:
+            return -1
 
+        cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO Trash
-
             (UID, LastLoc, TrashedDate)
             VALUES (?, ?, ?)
         """, (uid, lastLoc, today))
 
         conn.commit()
+        return 0
 
-    except Exception as e:
+    except sqlite3.Error as e:
         if conn:
             conn.rollback()
 
         print(f"Failed to handle trash: {e}")
+        return -1
 
     finally:
         if conn:
             conn.close()
-
-    return 0
 
 
 def restoreHandeling(uid: str):
@@ -113,6 +157,9 @@ def restoreHandeling(uid: str):
 
     try:
         conn = getConnection()
+        if conn is None:
+            return None
+
         cursor = conn.cursor()
         cursor.execute("""
             SELECT LastLoc
@@ -121,7 +168,6 @@ def restoreHandeling(uid: str):
         """, (uid,))
 
         row = cursor.fetchone()
-
         if row is None:
             return None
 
@@ -133,10 +179,9 @@ def restoreHandeling(uid: str):
         """, (uid,))
 
         conn.commit()
-
         return lastLoc
 
-    except Exception as e:
+    except sqlite3.Error as e:
         if conn:
             conn.rollback()
 
@@ -153,11 +198,13 @@ def clearing(UID=None):
 
     try:
         conn = getConnection()
+        if conn is None:
+            return -1
+
         cursor = conn.cursor()
 
         if UID is None:
             cutoffDate = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-
             cursor.execute("""
                 DELETE FROM Trash
                 WHERE TrashedDate < ?
@@ -169,19 +216,18 @@ def clearing(UID=None):
             """, (UID,))
 
         conn.commit()
+        return 0
 
-    except Exception as e:
+    except sqlite3.Error as e:
         if conn:
             conn.rollback()
 
         print(f"Failed to clear trash: {e}")
+        return -1
 
     finally:
         if conn:
             conn.close()
 
-    return 0
 
-
-if __name__ == "__main__":
-    makeTable()
+makeTable()
