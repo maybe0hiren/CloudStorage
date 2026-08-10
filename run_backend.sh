@@ -1,11 +1,13 @@
 #!/bin/bash
 
-cd "$(dirname "$0")/backend" || exit 1
+set -e
+
+cd "$(dirname "$0")/backend"
 
 if [ ! -d "env" ]; then
     python3 -m venv env
 fi
 
 source env/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python run.py

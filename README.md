@@ -1,68 +1,50 @@
-# ☁️ Overcast
+# Cloud Storage
 
-LAN-first personal cloud storage for a home lab.
+A local-first file storage backend with SQLite metadata, atomic uploads,
+trash/restore, text-file editing, share links, and HTTP range streaming.
 
 ## Backend
 
-The backend is a Flask application. It is configured to listen on `0.0.0.0:8000`, so other devices on the same home network can connect to the Debian laptop.
-
-The backend does **not** require an internet connection.
-
-### Run on the Debian laptop
-
-```bash
-cd CloudStorage
-./run_backend.sh
-```
-
-Or manually:
-
 ```bash
 cd backend
-auto activate env
+python3 -m venv env
+source env/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 python run.py
 ```
 
-The LAN address will be:
+The default development bind address is `127.0.0.1:8000`.
 
-```text
-http://<DEBIAN-LAPTOP-IP>:8000
+For LAN deployment, set:
+
+```env
+HOST="0.0.0.0"
+PORT="8000"
 ```
 
-For example, if the laptop's LAN address is `192.168.1.50`:
+The backend creates its runtime directories automatically.
 
-```text
-http://192.168.1.50:8000/api/health
-```
+## Runtime data
 
-### Important LAN note
+Do not commit these:
 
-Binding to `0.0.0.0` makes the service available on the laptop's network interfaces. Keep the service behind your home LAN and **do not configure router port forwarding** if this is intended to remain a home-only cloud.
+- `.env`
+- SQLite database
+- `storage/`
+- `preview/`
+- `temp/`
+- logs
 
-## Storage
+The database uses SQLite WAL mode and full synchronous writes.
 
-The backend keeps the real files in `backend/storage/` using the generated UID as the physical filename. The SQLite database stores the user's logical path and filename.
+## Production
 
-This means moving/renaming a file does not expose the real storage filename.
+For a permanent Linux deployment, run the Flask application behind
+Gunicorn and a reverse proxy such as Nginx. Keep the application and
+runtime data on separate directories and back up both the database and
+stored files.
 
-## Main API
-
-- `GET /api/health`
-- `GET /api/files`
-- `GET /api/files/<uid>`
-- `POST /api/files/upload`
-- `POST /api/files/text`
-- `GET /api/files/<uid>/download`
-- `GET /api/files/<uid>/preview`
-- `GET /api/files/<uid>/text`
-- `PUT /api/files/<uid>/text`
-- `GET /api/files/<uid>/stream`
-- `PUT /api/files/<uid>/path`
-- `DELETE /api/files/<uid>` — move to trash
-- `GET /api/trash`
-- `POST /api/trash/<uid>/restore`
-- `DELETE /api/trash/<uid>` — permanently delete
-- `POST /api/files/<uid>/link`
-- `GET /sharing/<encoded>.file`
-
-The frontend can be built against these endpoints later.
+The system is designed to fail safely where possible, but no storage
+software can literally guarantee that hardware, disks, power, or the
+operating system will never fail. Keep backups of important data.

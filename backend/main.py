@@ -1,9 +1,20 @@
+import hashlib
 import mimetypes
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, request, send_file, stream_with_context
+from flask import (
+    Flask,
+    Response,
+    jsonify,
+    request,
+    send_file,
+    stream_with_context,
+)
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 load_dotenv()
@@ -15,18 +26,29 @@ import functions.textFileHandlers as textFileHandlers
 import functions.trashHandeling as trashHandeling
 
 
-HOST = os.getenv("HOST", "0.0.0.0")
+HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", str(100 * 1024 * 1024)))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", str(8 * 1024 * 1024)))
+MAX_UPLOAD_SIZE = int(
+    os.getenv("MAX_UPLOAD_SIZE", str(20 * 1024 * 1024 * 1024))
+)
 
 BASE_PATH = Path(__file__).resolve().parent
-STORAGE = Path(os.getenv("STORAGE", "storage/"))
-PREVIEW_STORAGE = Path(os.getenv("PREVIEW_STORAGE", "preview/"))
 
-if not STORAGE.is_absolute():
-    STORAGE = BASE_PATH / STORAGE
-if not PREVIEW_STORAGE.is_absolute():
-    PREVIEW_STORAGE = BASE_PATH / PREVIEW_STORAGE
+
+def getConfiguredPath(name, default):
+    value = Path(os.getenv(name, default))
+
+    if not value.is_absolute():
+        value = BASE_PATH / value
+
+    return value.resolve()
+
+
+STORAGE = getConfiguredPath("STORAGE", "storage/")
+PREVIEW_STORAGE = getConfiguredPath("PREVIEW_STORAGE", "preview/")
+TEMP_STORAGE = getConfiguredPath("TEMP_STORAGE", "temp/")
+DATABASE_PATH = dbHandlers.getDatabasePath()
 
 TEXT_EXTENSIONS = {
     "txt", "md", "json", "xml", "csv", "log", "py", "js", "ts",
@@ -44,151 +66,201 @@ IMAGE_EXTENSIONS = {
 }
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_SIZE", str(20 * 1024 * 1024 * 1024)))
-
-
-@app.after_request
-def addCorsHeaders(response):
-    # The frontend may be served from another device or development port.
-    # This does not expose the storage itself; only the HTTP API is shared.
-    response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Range"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges"
-    return response
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_SIZE
 
 
 def initialise():
     STORAGE.mkdir(parents=True, exist_ok=True)
     PREVIEW_STORAGE.mkdir(parents=True, exist_ok=True)
-    dbHandlers.makeTable()
-    dbTrashHandlers.makeTable()
+    TEMP_STORAGE.mkdir(parents=True, exist_ok=True)
+
+    if dbHandlers.makeTable() != 0:
+        raise RuntimeError("Database initialization failed")
 
 
 def normalisePath(filePath: str):
     if filePath is None:
         return None
 
-    filePath = filePath.replace("\\", "/").strip()
+    filePath = str(filePath).replace("\\", "/").strip()
     filePath = filePath.strip("/")
 
     if not filePath:
         return "home/"
 
-    return filePath + "/"
+    parts = [part for part in filePath.split("/") if part]
+
+    if any(part in {".", ".."} for part in parts):
+        raise ValueError("Invalid path")
+
+    return "/".join(parts) + "/"
 
 
 def getPhysicalPath(UID: str, fileFormat: str):
-    return STORAGE / f"{UID}.{fileFormat.lstrip('.') }"
+    safeFormat = (fileFormat or "bin").lstrip(".").lower()
+
+    if not safeFormat.isalnum():
+        raise ValueError("Invalid file format")
+
+    return STORAGE / f"{UID}.{safeFormat}"
 
 
 def getFileRecord(UID: str):
     return dbHandlers.getFile(UID)
 
 
-def createTextFile(fileName: str, filePath: str, content: str = ""):
-    if not fileName or not filePath:
-        return -1
+def calculateSHA256(filePath):
+    digest = hashlib.sha256()
+    size = 0
+
+    with Path(filePath).open("rb") as file:
+        while True:
+            chunk = file.read(CHUNK_SIZE)
+            if not chunk:
+                break
+
+            digest.update(chunk)
+            size += len(chunk)
+
+    return size, digest.hexdigest()
+
+
+def checkDiskSpace(requiredBytes=0):
+    usage = shutil.disk_usage(STORAGE)
+
+    # Keep at least 512 MiB free after an upload.
+    minimumFree = 512 * 1024 * 1024
+
+    return usage.free >= requiredBytes + minimumFree
+
+
+def saveUploadedFile(file, filePath, encryption="none"):
+    if file is None or not file.filename:
+        return None
+
+    fileName = secure_filename(file.filename)
+
+    if not fileName:
+        return None
 
     filePath = normalisePath(filePath)
     UID = stringPlay.makeUID(filePath, fileName)
+
+    if dbHandlers.getFile(UID) is not None:
+        return None
+
+    fileFormat = Path(fileName).suffix.lstrip(".").lower() or "bin"
+    finalPath = getPhysicalPath(UID, fileFormat)
+
+    if finalPath.exists():
+        return None
+
+    # FileStorage.save() writes to disk rather than loading the complete
+    # upload into RAM.
+    tempFile = None
+
+    try:
+        if not checkDiskSpace():
+            return None
+
+        fd, tempName = tempfile.mkstemp(
+            prefix=f".upload-{UID}-",
+            suffix=".tmp",
+            dir=str(TEMP_STORAGE),
+        )
+        os.close(fd)
+        tempFile = Path(tempName)
+
+        file.save(str(tempFile))
+
+        if not tempFile.exists():
+            return None
+
+        size, sha256 = calculateSHA256(tempFile)
+
+        if size > MAX_UPLOAD_SIZE:
+            return None
+
+        if not checkDiskSpace(size):
+            return None
+
+        # Atomic publish: a file is either absent or complete.
+        os.replace(tempFile, finalPath)
+        tempFile = None
+
+        addedUID = dbHandlers.addFile(
+            filePath,
+            fileName,
+            encryption,
+            UID,
+            size,
+            sha256,
+        )
+
+        if addedUID is None:
+            finalPath.unlink(missing_ok=True)
+            return None
+
+        return addedUID
+
+    except Exception as e:
+        print(f"Failed to save upload: {e}")
+
+        if tempFile is not None:
+            tempFile.unlink(missing_ok=True)
+
+        finalPath.unlink(missing_ok=True)
+        return None
+
+
+def createTextFile(fileName, filePath, content=""):
+    fileName = secure_filename(fileName or "")
+
+    if not fileName or content is None:
+        return -1
+
+    try:
+        filePath = normalisePath(filePath)
+    except ValueError:
+        return -1
+
     fileFormat = Path(fileName).suffix.lstrip(".").lower()
 
-    if not fileFormat:
+    if not fileFormat or fileFormat not in TEXT_EXTENSIONS:
         return -1
+
+    UID = stringPlay.makeUID(filePath, fileName)
 
     if dbHandlers.getFile(UID) is not None:
         return -1
 
-    status = textFileHandlers.saveToDisk(UID, fileFormat)
-    if status != 0:
+    if textFileHandlers.saveToDisk(UID, fileFormat) != 0:
         return -1
 
-    status = textFileHandlers.writeFile(UID, fileFormat, content)
-    if status != 0:
+    if textFileHandlers.writeFile(UID, fileFormat, content) != 0:
+        getPhysicalPath(UID, fileFormat).unlink(missing_ok=True)
         return -1
 
-    addedUID = dbHandlers.addFile(filePath, fileName, "none", UID)
+    size, sha256 = calculateSHA256(getPhysicalPath(UID, fileFormat))
+
+    addedUID = dbHandlers.addFile(
+        filePath,
+        fileName,
+        "none",
+        UID,
+        size,
+        sha256,
+    )
+
     if addedUID is None:
-        physicalPath = getPhysicalPath(UID, fileFormat)
-        if physicalPath.exists():
-            physicalPath.unlink()
+        getPhysicalPath(UID, fileFormat).unlink(missing_ok=True)
         return -1
 
     return 0
 
 
-def openFile(fileName: str, filePath: str):
-    filePath = normalisePath(filePath)
-    UID = dbHandlers.getID(filePath, fileName)
-
-    if UID is None:
-        return None
-
-    fileFormat = dbHandlers.getValue(UID, "Format")
-    if not fileFormat:
-        return None
-
-    physicalPath = getPhysicalPath(UID, fileFormat)
-    if not physicalPath.exists():
-        return None
-
-    return physicalPath
-
-
-def editTextFile(fileName: str, filePath: str, content: str):
-    if not fileName or not filePath or content is None:
-        return -1
-
-    filePath = normalisePath(filePath)
-    UID = dbHandlers.getID(filePath, fileName)
-
-    if UID is None:
-        return createTextFile(fileName, filePath, content)
-
-    fileFormat = dbHandlers.getValue(UID, "Format")
-    if not fileFormat:
-        return -1
-
-    return textFileHandlers.writeFile(UID, fileFormat, content)
-
-
-def openImage(fileName: str, filePath: str):
-    return openFile(fileName, filePath)
-
-
-def openVideo(fileName: str, filePath: str):
-    physicalPath = openFile(fileName, filePath)
-    if physicalPath is None:
-        return None, None
-
-    UID = dbHandlers.getID(normalisePath(filePath), fileName)
-    fileSize = physicalPath.stat().st_size
-    totalChunks = (fileSize + CHUNK_SIZE - 1) // CHUNK_SIZE
-
-    metadata = {
-        "uid": UID,
-        "fileName": fileName,
-        "fileSize": fileSize,
-        "chunkSize": CHUNK_SIZE,
-        "totalChunks": totalChunks,
-        "mimeType": mimetypes.guess_type(str(physicalPath))[0] or "application/octet-stream",
-    }
-
-    def chunkGenerator():
-        with physicalPath.open("rb") as file:
-            while True:
-                chunk = file.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                yield chunk
-
-    return metadata, chunkGenerator()
-
-
-def movePhysicalFile(oldUID: str, newUID: str, oldFormat: str, newFormat: str = None):
-    if newFormat is None:
-        newFormat = oldFormat
+def movePhysicalFile(oldUID, newUID, oldFormat, newFormat=None):
+    newFormat = newFormat or oldFormat
 
     oldPath = getPhysicalPath(oldUID, oldFormat)
     newPath = getPhysicalPath(newUID, newFormat)
@@ -196,144 +268,185 @@ def movePhysicalFile(oldUID: str, newUID: str, oldFormat: str, newFormat: str = 
     if oldPath == newPath:
         return True
 
-    if not oldPath.exists():
+    if not oldPath.exists() or newPath.exists():
         return False
 
-    if newPath.exists():
+    try:
+        os.replace(oldPath, newPath)
+        return True
+    except OSError as e:
+        print(f"Failed to move physical file: {e}")
         return False
 
-    oldPath.rename(newPath)
-    return True
 
-
-def moveToTrash(fileName: str, filePath: str):
-    filePath = normalisePath(filePath)
-    UID = dbHandlers.getID(filePath, fileName)
-
-    if UID is None:
-        return -1
-
-    return trashHandeling.trash(UID)
-
-
-def deleteFromDisk(uniqueID: str):
-    file = dbHandlers.getFile(uniqueID)
-    if file is None:
-        return -1
-
-    physicalPath = getPhysicalPath(uniqueID, file["Format"])
-    if physicalPath.exists():
-        physicalPath.unlink()
-
-    dbTrashHandlers.clearing(uniqueID)
-    return 0
-
-
-def saveNewFile(file, filePath: str, encryption: str = "none"):
-    if file is None or not file.filename:
-        return None
-
-    filePath = normalisePath(filePath)
-    fileName = secure_filename(file.filename)
-
-    if not fileName:
-        return None
-
-    UID = stringPlay.makeUID(filePath, fileName)
-
-    if dbHandlers.getFile(UID) is not None:
-        return None
-
-    fileFormat = Path(fileName).suffix.lstrip(".").lower()
-    if not fileFormat:
-        fileFormat = "bin"
-
-    fileOnDisk = getPhysicalPath(UID, fileFormat)
-    file.save(fileOnDisk)
-
-    if not fileOnDisk.exists():
-        return None
-
-    addedUID = dbHandlers.addFile(filePath, fileName, encryption, UID)
-    if addedUID is None:
-        fileOnDisk.unlink(missing_ok=True)
-        return None
-
-    return addedUID
-
-
-def restoreFile(uniqueID: str):
+def editFilePath(uniqueID, newPath, newName):
     file = dbHandlers.getFile(uniqueID)
     if file is None:
         return None
 
-    lastLoc = dbTrashHandlers.getValue(uniqueID, "LastLoc")
-    if lastLoc is None:
+    newName = secure_filename(newName or "")
+    if not newName:
         return None
 
-    oldUID = uniqueID
-    oldFormat = file["Format"]
-    oldName = file["FileName"]
-    newUID = stringPlay.makeUID(lastLoc, oldName)
-
-    if newUID != oldUID and dbHandlers.getFile(newUID) is not None:
+    try:
+        newPath = normalisePath(newPath)
+    except ValueError:
         return None
-
-    if not movePhysicalFile(oldUID, newUID, oldFormat, oldFormat):
-        return None
-
-    result = dbHandlers.editPath(oldUID, lastLoc, oldName)
-    if result is None:
-        movePhysicalFile(newUID, oldUID, oldFormat, oldFormat)
-        return None
-
-    dbTrashHandlers.clearing(oldUID)
-    return result
-
-
-def editFilePath(uniqueID: str, newPath: str, newName: str):
-    file = dbHandlers.getFile(uniqueID)
-    if file is None:
-        return None
-
-    newPath = normalisePath(newPath)
-    oldFormat = file["Format"]
-    newFormat = Path(newName).suffix.lstrip(".").lower() or oldFormat
 
     newUID = stringPlay.makeUID(newPath, newName)
 
     if newUID != uniqueID and dbHandlers.getFile(newUID) is not None:
         return None
 
-    if not movePhysicalFile(uniqueID, newUID, oldFormat, newFormat):
+    oldFormat = file["Format"]
+    newFormat = Path(newName).suffix.lstrip(".").lower() or oldFormat
+
+    if not movePhysicalFile(
+        uniqueID,
+        newUID,
+        oldFormat,
+        newFormat,
+    ):
         return None
 
     result = dbHandlers.editPath(uniqueID, newPath, newName)
+
     if result is None:
-        # Attempt to restore the physical filename.
-        movePhysicalFile(newUID, uniqueID, newFormat, oldFormat)
+        movePhysicalFile(
+            newUID,
+            uniqueID,
+            newFormat,
+            oldFormat,
+        )
         return None
 
     return result
 
 
+def restoreFile(uniqueID):
+    file = dbHandlers.getFile(uniqueID)
+    if file is None or file["FilePath"] != "Trash/":
+        return None
+
+    lastLoc = dbHandlers.getTrashLocation(uniqueID)
+
+    if lastLoc is None:
+        return None
+
+    newUID = stringPlay.makeUID(lastLoc, file["FileName"])
+
+    if newUID != uniqueID and dbHandlers.getFile(newUID) is not None:
+        return None
+
+    oldFormat = file["Format"]
+    newFormat = Path(file["FileName"]).suffix.lstrip(".").lower() or oldFormat
+
+    if not movePhysicalFile(
+        uniqueID,
+        newUID,
+        oldFormat,
+        newFormat,
+    ):
+        return None
+
+    result = dbHandlers.restoreFromTrash(
+        uniqueID,
+        lastLoc,
+        file["FileName"],
+    )
+
+    if result is None:
+        movePhysicalFile(
+            newUID,
+            uniqueID,
+            newFormat,
+            oldFormat,
+        )
+        return None
+
+    return result
+
+
+@app.after_request
+def addCorsHeaders(response):
+    origin = request.headers.get("Origin")
+
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization, Range"
+    )
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET, POST, PUT, DELETE, OPTIONS"
+    )
+    response.headers["Access-Control-Expose-Headers"] = (
+        "Content-Length, Content-Range, Accept-Ranges"
+    )
+
+    return response
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def uploadTooLarge(error):
+    return jsonify({
+        "error": "File exceeds the configured upload limit"
+    }), 413
+
+
+@app.errorhandler(Exception)
+def handleUnexpectedError(error):
+    print(f"Unhandled backend error: {error}")
+    return jsonify({"error": "Internal server error"}), 500
+
+
+@app.route("/api/<path:_path>", methods=["OPTIONS"])
+def options(_path):
+    return Response(status=204)
+
+
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok"})
+    databaseOK = dbHandlers.makeTable() == 0
+    storageOK = STORAGE.exists() and STORAGE.is_dir()
+
+    return jsonify({
+        "status": "ok" if databaseOK and storageOK else "degraded",
+        "database": databaseOK,
+        "storage": storageOK,
+    })
+
+
+@app.get("/api/storage")
+def storageInfo():
+    usage = shutil.disk_usage(STORAGE)
+
+    return jsonify({
+        "total": usage.total,
+        "used": usage.used,
+        "free": usage.free,
+    })
 
 
 @app.get("/api/files")
 def listFiles():
-    filePath = request.args.get("path")
-    if filePath:
-        filePath = normalisePath(filePath)
+    try:
+        filePath = request.args.get("path")
 
-    return jsonify(dbHandlers.getFiles(filePath))
+        if filePath:
+            filePath = normalisePath(filePath)
+
+        return jsonify(dbHandlers.getFiles(filePath))
+
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @app.get("/api/files/<uniqueID>")
 def getFile(uniqueID):
     file = getFileRecord(uniqueID)
+
     if file is None:
         return jsonify({"error": "File not found"}), 404
 
@@ -346,10 +459,16 @@ def uploadFile():
     filePath = request.form.get("path", "home/")
     encryption = request.form.get("encryption", "none")
 
+    try:
+        filePath = normalisePath(filePath)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
     if file is None:
         return jsonify({"error": "No file provided"}), 400
 
-    UID = saveNewFile(file, filePath, encryption)
+    UID = saveUploadedFile(file, filePath, encryption)
+
     if UID is None:
         return jsonify({"error": "Could not save file"}), 409
 
@@ -360,25 +479,32 @@ def uploadFile():
 def createText():
     data = request.get_json(silent=True) or {}
 
-    fileName = data.get("fileName")
-    filePath = data.get("filePath", "home/")
-    content = data.get("content", "")
+    status = createTextFile(
+        data.get("fileName"),
+        data.get("filePath", "home/"),
+        data.get("content", ""),
+    )
 
-    status = createTextFile(fileName, filePath, content)
     if status != 0:
         return jsonify({"error": "Could not create text file"}), 409
 
-    UID = dbHandlers.getID(normalisePath(filePath), fileName)
+    UID = dbHandlers.getID(
+        normalisePath(data.get("filePath", "home/")),
+        secure_filename(data.get("fileName", "")),
+    )
+
     return jsonify(dbHandlers.getFile(UID)), 201
 
 
 @app.get("/api/files/<uniqueID>/download")
 def downloadFile(uniqueID):
     file = dbHandlers.getFile(uniqueID)
+
     if file is None:
         return jsonify({"error": "File not found"}), 404
 
     physicalPath = getPhysicalPath(uniqueID, file["Format"])
+
     if not physicalPath.exists():
         return jsonify({"error": "File is missing from storage"}), 404
 
@@ -387,57 +513,76 @@ def downloadFile(uniqueID):
         as_attachment=True,
         download_name=file["FileName"],
         mimetype=mimetypes.guess_type(file["FileName"])[0],
+        conditional=True,
     )
 
 
 @app.get("/api/files/<uniqueID>/preview")
 def previewFile(uniqueID):
     file = dbHandlers.getFile(uniqueID)
+
     if file is None:
         return jsonify({"error": "File not found"}), 404
 
     physicalPath = getPhysicalPath(uniqueID, file["Format"])
+
     if not physicalPath.exists():
         return jsonify({"error": "File is missing from storage"}), 404
 
     return send_file(
         physicalPath,
-        mimetype=mimetypes.guess_type(file["FileName"])[0] or "application/octet-stream",
+        mimetype=mimetypes.guess_type(file["FileName"])[0]
+        or "application/octet-stream",
+        conditional=True,
     )
 
 
 @app.get("/api/files/<uniqueID>/text")
 def readText(uniqueID):
     file = dbHandlers.getFile(uniqueID)
+
     if file is None:
         return jsonify({"error": "File not found"}), 404
 
-    if file["Format"].lower() not in TEXT_EXTENSIONS:
+    if (file["Format"] or "").lower() not in TEXT_EXTENSIONS:
         return jsonify({"error": "File is not a text file"}), 400
 
     try:
-        content = textFileHandlers.readFile(uniqueID, file["Format"])
-        return jsonify({"content": content})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 404
+        return jsonify({
+            "content": textFileHandlers.readFile(
+                uniqueID,
+                file["Format"],
+            )
+        })
+    except (OSError, UnicodeError):
+        return jsonify({"error": "Could not read file"}), 500
 
 
 @app.put("/api/files/<uniqueID>/text")
 def editText(uniqueID):
     file = dbHandlers.getFile(uniqueID)
+
     if file is None:
         return jsonify({"error": "File not found"}), 404
 
-    if file["Format"].lower() not in TEXT_EXTENSIONS:
+    if (file["Format"] or "").lower() not in TEXT_EXTENSIONS:
         return jsonify({"error": "File is not a text file"}), 400
 
     data = request.get_json(silent=True) or {}
-    if "content" not in data:
+
+    if "content" not in data or not isinstance(data["content"], str):
         return jsonify({"error": "Content is required"}), 400
 
-    status = textFileHandlers.writeFile(uniqueID, file["Format"], data["content"])
-    if status != 0:
+    if textFileHandlers.writeFile(
+        uniqueID,
+        file["Format"],
+        data["content"],
+    ) != 0:
         return jsonify({"error": "Could not edit file"}), 500
+
+    physicalPath = getPhysicalPath(uniqueID, file["Format"])
+    size, sha256 = calculateSHA256(physicalPath)
+    dbHandlers.updateFileMetadata(uniqueID, size, sha256)
 
     return jsonify(dbHandlers.getFile(uniqueID))
 
@@ -445,86 +590,132 @@ def editText(uniqueID):
 @app.get("/api/files/<uniqueID>/stream")
 def streamFile(uniqueID):
     file = dbHandlers.getFile(uniqueID)
+
     if file is None:
         return jsonify({"error": "File not found"}), 404
 
     physicalPath = getPhysicalPath(uniqueID, file["Format"])
+
     if not physicalPath.exists():
         return jsonify({"error": "File is missing from storage"}), 404
 
     fileSize = physicalPath.stat().st_size
-    mimeType = mimetypes.guess_type(file["FileName"])[0] or "application/octet-stream"
+    mimeType = (
+        mimetypes.guess_type(file["FileName"])[0]
+        or "application/octet-stream"
+    )
+
     rangeHeader = request.headers.get("Range")
 
     if not rangeHeader:
-        return send_file(physicalPath, mimetype=mimeType, conditional=True)
+        return send_file(
+            physicalPath,
+            mimetype=mimeType,
+            conditional=True,
+        )
+
+    if not rangeHeader.startswith("bytes="):
+        return Response(
+            status=416,
+            headers={"Content-Range": f"bytes */{fileSize}"},
+        )
 
     try:
-        rangeValue = rangeHeader.replace("bytes=", "")
-        startText, endText = rangeValue.split("-", 1)
-        start = int(startText) if startText else 0
-        end = int(endText) if endText else fileSize - 1
+        value = rangeHeader[6:].split(",", 1)[0]
+        startText, endText = value.split("-", 1)
+
+        if startText:
+            start = int(startText)
+            end = int(endText) if endText else fileSize - 1
+        else:
+            suffixLength = int(endText)
+            if suffixLength <= 0:
+                raise ValueError
+            start = max(fileSize - suffixLength, 0)
+            end = fileSize - 1
+
+        if start < 0 or start >= fileSize:
+            raise ValueError
+
         end = min(end, fileSize - 1)
 
-        if start > end or start >= fileSize:
-            return Response(status=416, headers={"Content-Range": f"bytes */{fileSize}"})
-
-        length = end - start + 1
-
-        def generate():
-            with physicalPath.open("rb") as fileHandle:
-                fileHandle.seek(start)
-                remaining = length
-
-                while remaining > 0:
-                    chunk = fileHandle.read(min(CHUNK_SIZE, remaining))
-                    if not chunk:
-                        break
-                    remaining -= len(chunk)
-                    yield chunk
-
-        response = Response(
-            stream_with_context(generate()),
-            status=206,
-            mimetype=mimeType,
-            direct_passthrough=True,
-        )
-        response.headers["Content-Range"] = f"bytes {start}-{end}/{fileSize}"
-        response.headers["Accept-Ranges"] = "bytes"
-        response.headers["Content-Length"] = str(length)
-        return response
+        if start > end:
+            raise ValueError
 
     except (ValueError, TypeError):
-        return jsonify({"error": "Invalid Range header"}), 416
+        return Response(
+            status=416,
+            headers={"Content-Range": f"bytes */{fileSize}"},
+        )
+
+    length = end - start + 1
+
+    def generate():
+        with physicalPath.open("rb") as fileHandle:
+            fileHandle.seek(start)
+            remaining = length
+
+            while remaining:
+                chunk = fileHandle.read(min(CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    response = Response(
+        stream_with_context(generate()),
+        status=206,
+        mimetype=mimeType,
+        direct_passthrough=True,
+    )
+
+    response.headers["Content-Range"] = (
+        f"bytes {start}-{end}/{fileSize}"
+    )
+    response.headers["Accept-Ranges"] = "bytes"
+    response.headers["Content-Length"] = str(length)
+
+    return response
 
 
 @app.put("/api/files/<uniqueID>/path")
 def editPath(uniqueID):
     data = request.get_json(silent=True) or {}
+
     newPath = data.get("newPath")
     newName = data.get("newName")
 
     if not newPath or not newName:
-        return jsonify({"error": "newPath and newName are required"}), 400
+        return jsonify({
+            "error": "newPath and newName are required"
+        }), 400
 
-    newUID = editFilePath(uniqueID, newPath, secure_filename(newName))
-    if newUID is None:
-        return jsonify({"error": "Could not move or rename file"}), 409
+    result = editFilePath(uniqueID, newPath, newName)
 
-    return jsonify(dbHandlers.getFile(newUID))
+    if result is None:
+        return jsonify({
+            "error": "Could not move or rename file"
+        }), 409
+
+    return jsonify(dbHandlers.getFile(result))
 
 
 @app.delete("/api/files/<uniqueID>")
 def trashFile(uniqueID):
     file = dbHandlers.getFile(uniqueID)
+
     if file is None:
         return jsonify({"error": "File not found"}), 404
 
-    status = trashHandeling.trash(uniqueID)
-    if status != 0:
-        return jsonify({"error": "Could not move file to trash"}), 500
+    if trashHandeling.trash(uniqueID) != 0:
+        return jsonify({
+            "error": "Could not move file to trash"
+        }), 500
 
-    return jsonify({"status": "trashed", "UniqueID": uniqueID})
+    return jsonify({
+        "status": "trashed",
+        "UniqueID": uniqueID,
+    })
 
 
 @app.get("/api/trash")
@@ -534,6 +725,7 @@ def listTrash():
 
     for item in trash:
         file = dbHandlers.getFile(item["UID"])
+
         if file is not None:
             file.update(item)
             files.append(file)
@@ -544,8 +736,11 @@ def listTrash():
 @app.post("/api/trash/<uniqueID>/restore")
 def restoreTrash(uniqueID):
     newUID = restoreFile(uniqueID)
+
     if newUID is None:
-        return jsonify({"error": "Could not restore file"}), 409
+        return jsonify({
+            "error": "Could not restore file"
+        }), 409
 
     return jsonify(dbHandlers.getFile(newUID))
 
@@ -553,17 +748,63 @@ def restoreTrash(uniqueID):
 @app.delete("/api/trash/<uniqueID>")
 def permanentlyDelete(uniqueID):
     file = dbHandlers.getFile(uniqueID)
+
     if file is None:
         return jsonify({"error": "File not found"}), 404
 
     if file["FilePath"] != "Trash/":
-        return jsonify({"error": "File is not in trash"}), 400
+        return jsonify({
+            "error": "File is not in trash"
+        }), 400
 
-    status = deleteFromDisk(uniqueID)
-    if status != 0:
-        return jsonify({"error": "Could not delete file"}), 500
+    physicalPath = getPhysicalPath(
+        uniqueID,
+        file["Format"],
+    )
 
-    return jsonify({"status": "deleted", "UniqueID": uniqueID})
+    try:
+        if physicalPath.exists():
+            physicalPath.unlink()
+    except OSError as e:
+        print(f"Failed to delete physical file: {e}")
+        return jsonify({
+            "error": "Could not delete physical file"
+        }), 500
+
+    if dbHandlers.permanentlyDelete(uniqueID) != 0:
+        return jsonify({
+            "error": "Could not update database"
+        }), 500
+
+    return jsonify({
+        "status": "deleted",
+        "UniqueID": uniqueID,
+    })
+
+
+@app.post("/api/files/<uniqueID>/link")
+def createShareLink(uniqueID):
+    file = dbHandlers.getFile(uniqueID)
+
+    if file is None or file["FilePath"] == "Trash/":
+        return jsonify({"error": "File not found"}), 404
+
+    link = dbHandlers.makeLink(uniqueID)
+
+    if link is None:
+        endpoint = os.getenv("SHARING_ENDPOINT", "").strip()
+
+        if not endpoint:
+            endpoint = request.host_url.rstrip("/") + "/sharing"
+
+        link = stringPlay.makeLink(uniqueID, endpoint)
+
+        if dbHandlers.setLink(uniqueID, link) != 0:
+            return jsonify({
+                "error": "Could not save share link"
+            }), 500
+
+    return jsonify({"Link": link})
 
 
 @app.get("/sharing/<encoded>.file")
@@ -574,42 +815,37 @@ def sharing(encoded):
         return jsonify({"error": "Invalid sharing link"}), 400
 
     file = dbHandlers.getFile(UID)
+
     if file is None or file["FilePath"] == "Trash/":
         return jsonify({"error": "File not found"}), 404
 
-    physicalPath = getPhysicalPath(UID, file["Format"])
+    physicalPath = getPhysicalPath(
+        UID,
+        file["Format"],
+    )
+
     if not physicalPath.exists():
-        return jsonify({"error": "File is missing from storage"}), 404
+        return jsonify({
+            "error": "File is missing from storage"
+        }), 404
 
     return send_file(
         physicalPath,
         as_attachment=True,
         download_name=file["FileName"],
         mimetype=mimetypes.guess_type(file["FileName"])[0],
+        conditional=True,
     )
-
-
-@app.post("/api/files/<uniqueID>/link")
-def createShareLink(uniqueID):
-    file = dbHandlers.getFile(uniqueID)
-    if file is None:
-        return jsonify({"error": "File not found"}), 404
-
-    link = dbHandlers.makeLink(uniqueID)
-    if link is None:
-        sharingEndpoint = os.getenv("SHARING_ENDPOINT")
-        if not sharingEndpoint:
-            sharingEndpoint = request.host_url.rstrip("/") + "/sharing/"
-
-        link = stringPlay.makeLink(uniqueID, sharingEndpoint)
-        dbHandlers.setLink(uniqueID, link)
-
-    return jsonify({"Link": link})
 
 
 initialise()
 
 
 if __name__ == "__main__":
-    print(f"Overcast backend running on http://{HOST}:{PORT}")
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    print(f"Cloud Storage backend running on http://{HOST}:{PORT}")
+    app.run(
+        host=HOST,
+        port=PORT,
+        debug=False,
+        threaded=True,
+    )
